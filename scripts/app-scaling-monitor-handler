@@ -1,0 +1,110 @@
+#!/bin/bash
+# app-scaling-monitor-handler — triggered by udev on monitor hotplug
+# Reads [monitors] section from scales.conf to auto-adjust GNOME scaling
+# Install: sudo cp config/99-app-scaling-monitor.rules /etc/udev/rules.d/
+
+set -euo pipefail
+
+CONFIG="$HOME/.config/app-scaling/scales.conf"
+LOG="$HOME/.config/app-scaling/monitor.log"
+LOCK="/tmp/app-scaling-monitor.lock"
+
+# udev runs as root, so we need the user's display environment
+# These are set by install.sh in the udev rule itself
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+
+# Prevent duplicate triggers (udev can fire multiple change events)
+if [[ -f "$LOCK" ]]; then
+    lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK") ))
+    if [[ "$lock_age" -lt 5 ]]; then
+        exit 0
+    fi
+fi
+touch "$LOCK"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
+}
+
+# Wait for xrandr to reflect the new monitor state
+sleep 2
+
+# Detect current resolution
+RESOLUTION=$(xrandr 2>/dev/null | grep '\*' | head -1 | awk '{print $1}')
+RES_HEIGHT=$(echo "$RESOLUTION" | cut -d'x' -f2)
+
+if [[ -z "$RES_HEIGHT" ]]; then
+    log "ERROR: Could not detect resolution"
+    rm -f "$LOCK"
+    exit 1
+fi
+
+log "Monitor change detected. Resolution: $RESOLUTION (height: $RES_HEIGHT)"
+
+if [[ ! -f "$CONFIG" ]]; then
+    log "No config found at $CONFIG"
+    rm -f "$LOCK"
+    exit 1
+fi
+
+# Read [monitors] section to find target GNOME percentage for this resolution
+get_section() {
+    local target="$1"
+    local in_section=false
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$target" ]]; then
+                in_section=true
+            else
+                $in_section && return 0
+                in_section=false
+            fi
+            continue
+        fi
+        $in_section && echo "$line"
+    done < "$CONFIG"
+}
+
+TARGET_PCT=""
+get_section "monitors" | while IFS= read -r line; do
+    height=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+    pct=$(echo "$line" | sed 's/[^=]*=\s*//' | tr -d '[:space:]')
+    if [[ "$RES_HEIGHT" == "$height" ]]; then
+        echo "$pct"
+        break
+    fi
+done | read -r TARGET_PCT || true
+
+if [[ -z "$TARGET_PCT" ]]; then
+    log "No monitor mapping found for resolution height $RES_HEIGHT, skipping"
+    rm -f "$LOCK"
+    exit 0
+fi
+
+# Check if scaling is already at the target
+CURRENT_PCT="100"
+GLOBAL_SCALE_FILE="$HOME/.config/app-scaling/global-scale"
+if [[ -f "$GLOBAL_SCALE_FILE" ]]; then
+    CURRENT_PCT=$(cat "$GLOBAL_SCALE_FILE")
+fi
+
+if [[ "$CURRENT_PCT" == "$TARGET_PCT" ]]; then
+    log "Already at ${TARGET_PCT}%, no change needed"
+    rm -f "$LOCK"
+    exit 0
+fi
+
+log "Adjusting GNOME scaling: ${CURRENT_PCT}% -> ${TARGET_PCT}% (relative adjustment)"
+
+# Apply the change with relative factor adjustment
+"$HOME/.local/bin/app-scaling" global "$TARGET_PCT" --relative >> "$LOG" 2>&1
+
+# Send desktop notification
+notify-send "App Scaling" \
+    "Monitor changed to ${RES_HEIGHT}p — GNOME scaling set to ${TARGET_PCT}%" \
+    2>/dev/null || true
+
+log "Done."
+rm -f "$LOCK"

@@ -1,0 +1,528 @@
+#!/bin/bash
+# app-scaling — manage the per-app scaling system
+# Usage: app-scaling <command>
+#   setup              — generate wrappers + patch desktop files
+#   teardown           — remove wrappers + restore desktop files
+#   status             — show what's configured and active
+#   test APP           — show what scaling would be applied for an app
+#   global PCT         — change GNOME fractional scaling percentage
+#     --relative       — adjust per-app scale factors to compensate
+#     --no-save        — don't write adjusted factors to scales.conf
+#   migrate            — migrate old config format to new section format
+
+set -euo pipefail
+
+CONFIG="$HOME/.config/app-scaling/scales.conf"
+OVERRIDE="$HOME/.config/app-scaling/scales.override"
+GLOBAL_SCALE_FILE="$HOME/.config/app-scaling/global-scale"
+WRAPPERS_DIR="$HOME/.local/bin/scaled"
+LOCAL_APPS="$HOME/.local/share/applications"
+
+# --- Config helpers ---
+
+# Extract a section from the config file
+get_section() {
+    local target="$1"
+    local file="${2:-$CONFIG}"
+    local in_section=false
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$target" ]]; then
+                in_section=true
+            else
+                $in_section && return 0
+                in_section=false
+            fi
+            continue
+        fi
+        $in_section && echo "$line"
+    done < "$file"
+}
+
+# Get app lines from [apps] section (or whole file for old format)
+get_app_lines() {
+    local file="${1:-$CONFIG}"
+    local in_apps=false
+    local has_sections=false
+    if grep -q '^\[' "$file"; then
+        has_sections=true
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            [[ "${BASH_REMATCH[1]}" == "apps" ]] && in_apps=true || in_apps=false
+            continue
+        fi
+        if $has_sections; then
+            $in_apps && [[ "$line" =~ .*=.*: ]] && echo "$line"
+        else
+            [[ "$line" =~ .*=.*: ]] && echo "$line"
+        fi
+    done < "$file"
+}
+
+# Get default scale for a toolkit from [defaults] section
+get_default_scale() {
+    local toolkit="$1"
+    local line
+    line=$(get_section "defaults" | grep -E "^${toolkit}\s*=" | head -1)
+    if [[ -n "$line" ]]; then
+        echo "$line" | sed 's/[^=]*=\s*//' | tr -d '[:space:]'
+    fi
+}
+
+# Get current GNOME scaling percentage
+get_current_global_scale() {
+    if [[ -f "$GLOBAL_SCALE_FILE" ]]; then
+        cat "$GLOBAL_SCALE_FILE"
+    else
+        # Try to detect from xrandr transform on the primary output
+        # GNOME fractional scaling uses xrandr --scale which shows as a transform matrix
+        local primary_output transform
+        primary_output=$(xrandr --query 2>/dev/null | grep ' connected primary' | awk '{print $1}')
+        transform=$(xrandr --verbose 2>/dev/null | sed -n "/${primary_output}/,/^[A-Z]/p" | grep "Transform:" | head -1 | awk '{print $2}')
+        if [[ -n "$transform" && "$transform" != "1.000000" ]]; then
+            awk "BEGIN {printf \"%d\", $transform * 100}"
+        else
+            # Fallback: compare virtual vs native resolution
+            local virtual_w native_w
+            virtual_w=$(xrandr 2>/dev/null | grep 'connected primary' | grep -oP '\d+x\d+' | head -1 | cut -d'x' -f1)
+            native_w=$(xrandr 2>/dev/null | grep '\*' | head -1 | awk '{print $1}' | cut -d'x' -f1)
+            if [[ -n "$virtual_w" && -n "$native_w" && "$native_w" -gt 0 && "$virtual_w" != "$native_w" ]]; then
+                awk "BEGIN {printf \"%d\", ($virtual_w / $native_w) * 100}"
+            else
+                echo "100"
+            fi
+        fi
+    fi
+}
+
+# --- Commands ---
+
+cmd_migrate() {
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "No config found at $CONFIG"
+        return 1
+    fi
+
+    # Check if already migrated
+    if grep -q '^\[' "$CONFIG"; then
+        echo "Config already uses section format, no migration needed."
+        return 0
+    fi
+
+    echo "Migrating config to new section format..."
+    cp "$CONFIG" "${CONFIG}.bak"
+    echo "  Backed up to ${CONFIG}.bak"
+
+    local OLD_CONTENT
+    OLD_CONTENT=$(cat "$CONFIG")
+
+    cat > "$CONFIG" <<'HEADER'
+# Per-app scaling configuration
+# See CLAUDE.md for full documentation
+
+[monitors]
+# resolution_height = gnome_scaling_percentage
+# Used by auto-switch daemon when monitors are plugged/unplugged
+2160 = 150
+1440 = 125
+1080 = 100
+
+[defaults]
+# Per-toolkit default scale factors
+# Apps with an empty scale value inherit from here
+# wine = 3.0
+# qt = 1.0
+# gtk = 1.0
+# electron = 1.0
+
+[apps]
+HEADER
+
+    # Append old content (skip old header comments about format)
+    echo "$OLD_CONTENT" | grep -v '^# Per-app scaling' | grep -v '^# Format:' \
+        | grep -v '^# Toolkits:' | grep -v '^# Use 1.0' \
+        | grep -v '^# The launcher' | grep -v '^# To find' \
+        | grep -v '^# Electron apps' | grep -v '^$' >> "$CONFIG"
+
+    echo "  Migration complete. Review: $CONFIG"
+}
+
+cmd_setup() {
+    # Auto-migrate if needed
+    if [[ -f "$CONFIG" ]] && ! grep -q '^\[' "$CONFIG"; then
+        cmd_migrate
+        echo ""
+    fi
+
+    echo "=== Generating PATH wrappers ==="
+    generate-wrappers
+    echo ""
+    echo "=== Patching desktop files ==="
+    patch-desktop-scaling
+
+    # Save current global scale if not already saved
+    if [[ ! -f "$GLOBAL_SCALE_FILE" ]]; then
+        mkdir -p "$(dirname "$GLOBAL_SCALE_FILE")"
+        get_current_global_scale > "$GLOBAL_SCALE_FILE"
+        echo ""
+        echo "Saved current GNOME scaling: $(cat "$GLOBAL_SCALE_FILE")%"
+    fi
+}
+
+cmd_teardown() {
+    echo "=== Removing PATH wrappers ==="
+    generate-wrappers --clean
+    echo ""
+    echo "=== Restoring desktop files ==="
+    patch-desktop-scaling --restore
+    # Clean up override file if it exists
+    rm -f "$OVERRIDE"
+}
+
+cmd_status() {
+    echo "=== Configuration ==="
+    if [[ -f "$CONFIG" ]]; then
+        echo "Config: $CONFIG"
+
+        # Show global scale
+        local current_pct
+        current_pct=$(get_current_global_scale)
+        echo "GNOME scaling: ${current_pct}%"
+
+        # Show defaults
+        local defaults
+        defaults=$(get_section "defaults" 2>/dev/null)
+        if [[ -n "$defaults" ]]; then
+            echo ""
+            echo "Toolkit defaults:"
+            echo "$defaults" | while IFS= read -r line; do
+                local tk val
+                tk=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+                val=$(echo "$line" | sed 's/[^=]*=\s*//' | tr -d '[:space:]')
+                printf "  %-10s %s\n" "$tk" "$val"
+            done
+        fi
+
+        echo ""
+        echo "Configured apps:"
+        get_app_lines | while IFS= read -r line; do
+            APP=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+            TOOLKIT=$(echo "$line" | sed 's/.*:\s*//' | tr -d '[:space:]')
+            SCALES=$(echo "$line" | sed 's/[^=]*=\s*//;s/\s*:.*//' | tr -d '[:space:]')
+            if [[ -z "$SCALES" ]]; then
+                SCALES="(default: $(get_default_scale "$TOOLKIT"))"
+            fi
+            INSTALLED="not found"
+            command -v "$APP" &>/dev/null && INSTALLED="installed"
+            printf "  %-20s %-10s %-12s %s\n" "$APP" "$TOOLKIT" "$SCALES" "($INSTALLED)"
+        done
+
+        # Show monitor mappings
+        local monitors
+        monitors=$(get_section "monitors" 2>/dev/null)
+        if [[ -n "$monitors" ]]; then
+            echo ""
+            echo "Monitor resolution mappings:"
+            echo "$monitors" | while IFS= read -r line; do
+                local height pct
+                height=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+                pct=$(echo "$line" | sed 's/[^=]*=\s*//' | tr -d '[:space:]')
+                printf "  %sp -> %s%%\n" "$height" "$pct"
+            done
+        fi
+    else
+        echo "No config found at $CONFIG"
+    fi
+
+    if [[ -f "$OVERRIDE" ]]; then
+        echo ""
+        echo "=== Active Override ==="
+        echo "  Session override active: $OVERRIDE"
+        echo "  (created by 'app-scaling global --no-save')"
+    fi
+
+    echo ""
+    echo "=== PATH Wrappers ==="
+    if [[ -d "$WRAPPERS_DIR" ]] && ls "$WRAPPERS_DIR"/* &>/dev/null; then
+        for f in "$WRAPPERS_DIR"/*; do
+            echo "  $(basename "$f")"
+        done
+    else
+        echo "  (none)"
+    fi
+
+    echo ""
+    echo "=== Patched Desktop Files ==="
+    BACKUP="$HOME/.config/app-scaling/desktop-backups/patched-files.list"
+    if [[ -f "$BACKUP" ]] && [[ -s "$BACKUP" ]]; then
+        while read -r f; do
+            echo "  $(basename "$f")"
+        done < "$BACKUP"
+    else
+        echo "  (none)"
+    fi
+
+    echo ""
+    echo "=== PATH Check ==="
+    if echo "$PATH" | tr ':' '\n' | grep -q "\.local/bin/scaled"; then
+        echo "  ~/.local/bin/scaled is in PATH"
+    else
+        echo "  WARNING: ~/.local/bin/scaled is NOT in PATH"
+        echo "  Add to ~/.bashrc: export PATH=\"\$HOME/.local/bin/scaled:\$PATH\""
+    fi
+}
+
+cmd_test() {
+    local app="${1:-}"
+    if [[ -z "$app" ]]; then
+        echo "Usage: app-scaling test <app-name>" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "No config found" >&2
+        exit 1
+    fi
+
+    LINE=$(get_app_lines | grep -E "^${app}\s*=" | head -1)
+    if [[ -z "$LINE" ]]; then
+        echo "'$app' is not in the config — would launch without scaling"
+        exit 0
+    fi
+
+    TOOLKIT=$(echo "$LINE" | sed 's/.*:\s*//' | tr -d '[:space:]')
+    SCALES=$(echo "$LINE" | sed 's/[^=]*=\s*//;s/\s*:.*//')
+
+    # Resolve empty scales from defaults
+    if [[ -z "$(echo "$SCALES" | tr -d '[:space:]')" ]]; then
+        SCALES=$(get_default_scale "$TOOLKIT")
+        echo "(Using toolkit default)"
+    fi
+
+    RESOLUTION=$(xrandr 2>/dev/null | grep '\*' | head -1 | awk '{print $1}')
+    RES_HEIGHT=$(echo "$RESOLUTION" | cut -d'x' -f2)
+
+    if echo "$SCALES" | grep -q '/'; then
+        SCALE_1080=$(echo "$SCALES" | cut -d'/' -f1 | tr -d '[:space:]')
+        SCALE_4K=$(echo "$SCALES" | cut -d'/' -f2 | tr -d '[:space:]')
+        if [[ "$RES_HEIGHT" -ge 2160 ]]; then
+            SCALE="$SCALE_4K"
+            RES_LABEL="4K"
+        else
+            SCALE="$SCALE_1080"
+            RES_LABEL="1080p"
+        fi
+    else
+        SCALE=$(echo "$SCALES" | tr -d '[:space:]')
+        RES_LABEL="all"
+    fi
+
+    echo "App:        $app"
+    echo "Toolkit:    $TOOLKIT"
+    echo "Resolution: ${RESOLUTION:-unknown} ($RES_LABEL)"
+    echo "Scale:      $SCALE"
+    echo ""
+
+    case "$TOOLKIT" in
+        gtk)      echo "Would set:  GDK_DPI_SCALE=$SCALE" ;;
+        qt)       echo "Would set:  QT_SCALE_FACTOR=$SCALE" ;;
+        electron) echo "Would add:  --force-device-scale-factor=$SCALE" ;;
+        wine)
+            local dpi
+            dpi=$(awk "BEGIN {printf \"%d\", 96 * $SCALE}")
+            echo "Would set:  Wine LogPixels DPI=$dpi (0x$(printf '%x' "$dpi"))"
+            ;;
+    esac
+
+    if [[ "$SCALE" == "1.0" || "$SCALE" == "1" ]]; then
+        echo "(Scale is 1.0 — no adjustment would be applied)"
+    fi
+}
+
+cmd_global() {
+    local new_pct=""
+    local relative=false
+    local no_save=false
+
+    # Parse arguments
+    for arg in "$@"; do
+        case "$arg" in
+            --relative) relative=true ;;
+            --no-save)  no_save=true ;;
+            *)
+                if [[ -z "$new_pct" && "$arg" =~ ^[0-9]+$ ]]; then
+                    new_pct="$arg"
+                else
+                    echo "Unknown argument: $arg" >&2
+                    echo "Usage: app-scaling global <percentage> [--relative] [--no-save]" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$new_pct" ]]; then
+        echo "Usage: app-scaling global <percentage> [--relative] [--no-save]" >&2
+        echo ""
+        echo "Current GNOME scaling: $(get_current_global_scale)%"
+        exit 1
+    fi
+
+    local old_pct
+    old_pct=$(get_current_global_scale)
+
+    echo "GNOME scaling: ${old_pct}% -> ${new_pct}%"
+
+    # Calculate and apply relative scaling adjustment
+    if $relative && [[ "$old_pct" != "$new_pct" ]]; then
+        local ratio
+        ratio=$(awk "BEGIN {printf \"%.6f\", $old_pct / $new_pct}")
+        echo "Relative adjustment ratio: $ratio (${old_pct}/${new_pct})"
+        echo ""
+
+        # Process the config file, adjusting scale factors for non-wine apps
+        local target_file
+        if $no_save; then
+            target_file="$OVERRIDE"
+            cp "$CONFIG" "$OVERRIDE"
+            echo "Writing adjusted factors to override file (scales.conf unchanged)"
+        else
+            target_file="$CONFIG"
+            echo "Updating scale factors in scales.conf"
+        fi
+
+        # Create a temp file with adjusted values
+        local tmpfile
+        tmpfile=$(mktemp)
+        local in_apps=false
+
+        while IFS= read -r line; do
+            # Track section
+            if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+                [[ "${BASH_REMATCH[1]}" == "apps" ]] && in_apps=true || in_apps=false
+                echo "$line" >> "$tmpfile"
+                continue
+            fi
+
+            # Only adjust uncommented app lines in [apps] section
+            if $in_apps && [[ "$line" =~ ^[^#].*=.*: ]]; then
+                local app_name toolkit scales
+                app_name=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+                toolkit=$(echo "$line" | sed 's/.*:\s*//' | tr -d '[:space:]')
+                scales=$(echo "$line" | sed 's/[^=]*=\s*//;s/\s*:.*//')
+
+                # Skip wine apps (Wine DPI is independent of GNOME scaling)
+                if [[ "$toolkit" == "wine" ]]; then
+                    echo "$line" >> "$tmpfile"
+                    continue
+                fi
+
+                # Skip empty scales (they use defaults)
+                if [[ -z "$(echo "$scales" | tr -d '[:space:]')" ]]; then
+                    echo "$line" >> "$tmpfile"
+                    continue
+                fi
+
+                # Adjust scale factors
+                local new_scales
+                if echo "$scales" | grep -q '/'; then
+                    local s1 s2 new_s1 new_s2
+                    s1=$(echo "$scales" | cut -d'/' -f1 | tr -d '[:space:]')
+                    s2=$(echo "$scales" | cut -d'/' -f2 | tr -d '[:space:]')
+                    new_s1=$(awk "BEGIN {printf \"%.1f\", $s1 * $ratio}")
+                    new_s2=$(awk "BEGIN {printf \"%.1f\", $s2 * $ratio}")
+                    new_scales="$new_s1 / $new_s2"
+                else
+                    local s new_s
+                    s=$(echo "$scales" | tr -d '[:space:]')
+                    new_s=$(awk "BEGIN {printf \"%.1f\", $s * $ratio}")
+                    new_scales="$new_s"
+                fi
+
+                # Reconstruct the line preserving formatting
+                local padding
+                padding=$(echo "$line" | sed "s/${app_name}\s*=.*//" | wc -c)
+                printf "%-*s= %s : %s\n" "$((${#app_name} + padding - ${#app_name} - 1))" "$app_name" "$new_scales" "$toolkit" >> "$tmpfile"
+                echo "  $app_name: $scales -> $new_scales ($toolkit)"
+            else
+                echo "$line" >> "$tmpfile"
+            fi
+        done < "$target_file"
+
+        mv "$tmpfile" "$target_file"
+    elif $relative; then
+        echo "No change needed (same percentage)"
+    fi
+
+    # Apply GNOME scaling via xrandr
+    echo ""
+    echo "Applying GNOME fractional scaling..."
+
+    # Detect the primary output and native mode
+    local output native_mode
+    output=$(xrandr --query 2>/dev/null | grep ' connected primary' | awk '{print $1}')
+    if [[ -z "$output" ]]; then
+        output=$(xrandr --query 2>/dev/null | grep ' connected' | head -1 | awk '{print $1}')
+    fi
+    native_mode=$(xrandr --query 2>/dev/null | grep '\*' | head -1 | awk '{print $1}')
+
+    if [[ -z "$output" || -z "$native_mode" ]]; then
+        echo "ERROR: Could not detect display output or native mode" >&2
+        exit 1
+    fi
+
+    # Calculate xrandr scale factor
+    # GNOME fractional scaling renders at a higher virtual resolution then downscales
+    # xrandr scale = percentage / 100
+    local xrandr_scale
+    xrandr_scale=$(awk "BEGIN {printf \"%.4f\", $new_pct / 100}")
+
+    echo "  Output: $output"
+    echo "  Mode: $native_mode"
+    echo "  xrandr scale: ${xrandr_scale}x${xrandr_scale}"
+
+    xrandr --output "$output" --scale "${xrandr_scale}x${xrandr_scale}" --mode "$native_mode"
+
+    # Save the new global scale
+    mkdir -p "$(dirname "$GLOBAL_SCALE_FILE")"
+    echo "$new_pct" > "$GLOBAL_SCALE_FILE"
+
+    # Regenerate wrappers and desktop patches
+    echo ""
+    echo "Regenerating wrappers and desktop patches..."
+    generate-wrappers
+    patch-desktop-scaling
+
+    echo ""
+    echo "Done. GNOME scaling is now ${new_pct}%."
+    if $no_save; then
+        echo "Scale factors are session-only (override file: $OVERRIDE)"
+        echo "To remove override: rm $OVERRIDE"
+    fi
+}
+
+case "${1:-}" in
+    setup)    cmd_setup ;;
+    teardown) cmd_teardown ;;
+    status)   cmd_status ;;
+    test)     shift; cmd_test "$@" ;;
+    global)   shift; cmd_global "$@" ;;
+    migrate)  cmd_migrate ;;
+    *)
+        echo "Usage: app-scaling <command>"
+        echo ""
+        echo "Commands:"
+        echo "  setup              — generate wrappers + patch desktop files"
+        echo "  teardown           — remove wrappers + restore desktop files"
+        echo "  status             — show what's configured and active"
+        echo "  test APP           — show what scaling would be applied for an app"
+        echo "  global PCT         — change GNOME fractional scaling percentage"
+        echo "    --relative       — adjust per-app scale factors to compensate"
+        echo "    --no-save        — don't write adjusted factors to scales.conf"
+        echo "  migrate            — migrate old config format to new section format"
+        exit 1
+        ;;
+esac

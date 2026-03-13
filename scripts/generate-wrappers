@@ -1,0 +1,71 @@
+#!/bin/bash
+# generate-wrappers — create PATH-based wrappers for scaled apps
+# Usage: generate-wrappers [--clean]
+# Reads apps from ~/.config/app-scaling/scales.conf
+# Wrappers go in ~/.local/bin/scaled/ (must be in PATH before /usr/bin)
+
+set -euo pipefail
+
+CONFIG="$HOME/.config/app-scaling/scales.conf"
+WRAPPERS_DIR="$HOME/.local/bin/scaled"
+
+if [[ "${1:-}" == "--clean" ]]; then
+    echo "Removing all wrappers from $WRAPPERS_DIR..."
+    rm -rf "$WRAPPERS_DIR"
+    echo "Done."
+    exit 0
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Config not found: $CONFIG" >&2
+    exit 1
+fi
+
+mkdir -p "$WRAPPERS_DIR"
+
+# Remove old wrappers first (clean slate)
+rm -f "$WRAPPERS_DIR"/*
+
+# Extract app lines from [apps] section (or whole file for old format)
+get_app_lines() {
+    local in_apps=false
+    local has_sections=false
+    # Check if config uses sections
+    if grep -q '^\[' "$CONFIG"; then
+        has_sections=true
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            [[ "${BASH_REMATCH[1]}" == "apps" ]] && in_apps=true || in_apps=false
+            continue
+        fi
+        if $has_sections; then
+            $in_apps && [[ "$line" =~ .*=.*: ]] && echo "$line"
+        else
+            [[ "$line" =~ .*=.*: ]] && echo "$line"
+        fi
+    done < "$CONFIG"
+}
+
+COUNT=0
+get_app_lines | while IFS= read -r line; do
+    APP_NAME=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+
+    # Only create wrapper if the app is actually installed
+    if ! command -v "$APP_NAME" &>/dev/null; then
+        echo "SKIP: '$APP_NAME' not found in PATH"
+        continue
+    fi
+
+    cat > "$WRAPPERS_DIR/$APP_NAME" <<EOF
+#!/bin/bash
+exec scaled-launch $APP_NAME "\$@"
+EOF
+    chmod +x "$WRAPPERS_DIR/$APP_NAME"
+    echo "CREATED: $WRAPPERS_DIR/$APP_NAME"
+done
+
+echo ""
+echo "Wrappers generated in $WRAPPERS_DIR"
+echo "Ensure this is in your PATH: export PATH=\"\$HOME/.local/bin/scaled:\$PATH\""

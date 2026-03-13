@@ -1,0 +1,128 @@
+#!/bin/bash
+# patch-desktop-scaling — copy and patch .desktop files to use scaled-launch
+# Usage: patch-desktop-scaling [--dry-run] [--restore]
+# Reads apps from ~/.config/app-scaling/scales.conf
+
+set -euo pipefail
+
+CONFIG="$HOME/.config/app-scaling/scales.conf"
+LOCAL_APPS="$HOME/.local/share/applications"
+SYSTEM_APPS="/usr/share/applications"
+SNAP_APPS="/var/lib/snapd/desktop/applications"
+BACKUP_DIR="$HOME/.config/app-scaling/desktop-backups"
+DRY_RUN=false
+RESTORE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --restore) RESTORE=true ;;
+    esac
+done
+
+if $RESTORE; then
+    echo "Restoring: removing patched .desktop files..."
+    if [[ -f "$BACKUP_DIR/patched-files.list" ]]; then
+        while read -r f; do
+            if [[ -f "$f" ]]; then
+                rm "$f"
+                echo "  Removed $f"
+            fi
+        done < "$BACKUP_DIR/patched-files.list"
+        rm "$BACKUP_DIR/patched-files.list"
+        echo "Done. Desktop entries restored to system defaults."
+        echo "Run 'update-desktop-database ~/.local/share/applications' to refresh."
+    else
+        echo "No backup list found. Nothing to restore."
+    fi
+    exit 0
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Config not found: $CONFIG" >&2
+    exit 1
+fi
+
+mkdir -p "$LOCAL_APPS" "$BACKUP_DIR"
+
+# Track what we patch for restore
+PATCHED_LIST="$BACKUP_DIR/patched-files.list"
+> "$PATCHED_LIST"
+
+# Extract app lines from [apps] section (or whole file for old format)
+get_app_lines() {
+    local in_apps=false
+    local has_sections=false
+    if grep -q '^\[' "$CONFIG"; then
+        has_sections=true
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            [[ "${BASH_REMATCH[1]}" == "apps" ]] && in_apps=true || in_apps=false
+            continue
+        fi
+        if $has_sections; then
+            $in_apps && [[ "$line" =~ .*=.*: ]] && echo "$line"
+        else
+            [[ "$line" =~ .*=.*: ]] && echo "$line"
+        fi
+    done < "$CONFIG"
+}
+
+# Read each uncommented app from config
+get_app_lines | while IFS= read -r line; do
+    APP_NAME=$(echo "$line" | sed 's/\s*=.*//' | tr -d '[:space:]')
+
+    # Find the .desktop file for this app (check system apps and snap apps)
+    DESKTOP_FILE=""
+    for candidate in "$SYSTEM_APPS/${APP_NAME}.desktop" \
+                     "$SYSTEM_APPS/${APP_NAME}-"*.desktop \
+                     "$SNAP_APPS/${APP_NAME}_${APP_NAME}.desktop" \
+                     "$SNAP_APPS/${APP_NAME}_"*.desktop; do
+        if [[ -f "$candidate" ]]; then
+            DESKTOP_FILE="$candidate"
+            break
+        fi
+    done
+
+    # Try common alternative names
+    if [[ -z "$DESKTOP_FILE" ]]; then
+        case "$APP_NAME" in
+            code) DESKTOP_FILE=$(ls "$SYSTEM_APPS"/code*.desktop 2>/dev/null | head -1) ;;
+            google-chrome) DESKTOP_FILE=$(ls "$SYSTEM_APPS"/google-chrome*.desktop 2>/dev/null | head -1) ;;
+            obs) DESKTOP_FILE=$(ls "$SYSTEM_APPS"/com.obsproject.Studio.desktop 2>/dev/null | head -1) ;;
+        esac
+    fi
+
+    if [[ -z "$DESKTOP_FILE" || ! -f "$DESKTOP_FILE" ]]; then
+        echo "SKIP: No .desktop file found for '$APP_NAME'"
+        continue
+    fi
+
+    TARGET="$LOCAL_APPS/$(basename "$DESKTOP_FILE")"
+
+    if $DRY_RUN; then
+        echo "WOULD PATCH: $DESKTOP_FILE -> $TARGET"
+        echo "  App: $APP_NAME"
+        continue
+    fi
+
+    # Copy system desktop file to local
+    cp "$DESKTOP_FILE" "$TARGET"
+
+    # Patch all Exec= lines to go through scaled-launch
+    # Match: Exec=/path/to/app or Exec=app-name
+    # Replace with: Exec=scaled-launch app-name
+    sed -i -E "s|^Exec=\S*${APP_NAME}\S*|Exec=scaled-launch ${APP_NAME}|" "$TARGET"
+
+    echo "$TARGET" >> "$PATCHED_LIST"
+    echo "PATCHED: $TARGET"
+done
+
+if ! $DRY_RUN; then
+    update-desktop-database "$LOCAL_APPS" 2>/dev/null || true
+    echo ""
+    echo "Done. Patched desktop files are in $LOCAL_APPS"
+    echo "To undo: $(basename "$0") --restore"
+fi

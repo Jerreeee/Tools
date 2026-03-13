@@ -1,0 +1,4 @@
+# Trigger app-scaling monitor handler on display hotplug events
+# Install: sudo cp this-file /etc/udev/rules.d/
+# Then: sudo udevadm control --reload-rules
+SUBSYSTEM=="drm", ACTION=="change", ENV{DISPLAY}=":0", RUN+="HANDLER_PATH"

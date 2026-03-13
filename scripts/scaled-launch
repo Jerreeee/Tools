@@ -1,0 +1,164 @@
+#!/bin/bash
+# scaled-launch — per-app scaling wrapper with resolution auto-detection
+# Usage: scaled-launch <app-name> [app-args...]
+# Config: ~/.config/app-scaling/scales.conf
+
+set -euo pipefail
+
+WRAPPERS_DIR="$HOME/.local/bin/scaled"
+
+# Resolve the real binary by searching PATH, skipping the wrappers directory
+resolve_real_binary() {
+    local name="$1"
+    while IFS= read -r dir; do
+        [[ "$dir" == "$WRAPPERS_DIR" ]] && continue
+        if [[ -x "$dir/$name" ]]; then
+            echo "$dir/$name"
+            return 0
+        fi
+    done <<< "$(echo "$PATH" | tr ':' '\n')"
+    return 1
+}
+
+# Extract a section from the config file
+# Usage: get_section "section_name" < config_file
+get_section() {
+    local target="$1"
+    local in_section=false
+    while IFS= read -r line; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Section header
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$target" ]]; then
+                in_section=true
+            else
+                $in_section && return 0
+                in_section=false
+            fi
+            continue
+        fi
+        $in_section && echo "$line"
+    done
+}
+
+# Read a default scale for a toolkit from [defaults] section
+get_default_scale() {
+    local toolkit="$1"
+    local config="$2"
+    local line
+    line=$(get_section "defaults" < "$config" | grep -E "^${toolkit}\s*=" | head -1)
+    if [[ -n "$line" ]]; then
+        echo "$line" | sed 's/[^=]*=\s*//' | tr -d '[:space:]'
+    fi
+}
+
+APP_NAME="$1"
+shift
+
+REAL_BIN=$(resolve_real_binary "$APP_NAME") || REAL_BIN="$APP_NAME"
+CONFIG="$HOME/.config/app-scaling/scales.conf"
+OVERRIDE="$HOME/.config/app-scaling/scales.override"
+
+# Use override file if it exists (created by app-scaling global --no-save)
+if [[ -f "$OVERRIDE" ]]; then
+    CONFIG="$OVERRIDE"
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+    exec "$REAL_BIN" "$@"
+fi
+
+# Find the config line for this app in the [apps] section
+LINE=$(get_section "apps" < "$CONFIG" | grep -E "^${APP_NAME}\s*=" | head -1)
+
+# Fallback: if no [apps] section exists (old format), search the whole file
+if [[ -z "$LINE" ]]; then
+    LINE=$(grep -E "^${APP_NAME}\s*=" "$CONFIG" 2>/dev/null | head -1)
+fi
+
+if [[ -z "$LINE" ]]; then
+    exec "$REAL_BIN" "$@"
+fi
+
+# Parse toolkit (after the colon)
+TOOLKIT=$(echo "$LINE" | sed 's/.*:\s*//' | tr -d '[:space:]')
+
+# Parse scale factors (between = and :)
+SCALES=$(echo "$LINE" | sed 's/[^=]*=\s*//;s/\s*:.*//')
+
+# If scale is empty, look up the toolkit default
+if [[ -z "$(echo "$SCALES" | tr -d '[:space:]')" ]]; then
+    SCALES=$(get_default_scale "$TOOLKIT" "$CONFIG")
+    if [[ -z "$SCALES" ]]; then
+        # No default found, launch without scaling
+        exec "$REAL_BIN" "$@"
+    fi
+fi
+
+# Detect current resolution
+RESOLUTION=$(xrandr 2>/dev/null | grep '\*' | head -1 | awk '{print $1}')
+RES_HEIGHT=$(echo "$RESOLUTION" | cut -d'x' -f2)
+
+# Pick the right scale factor based on resolution
+if echo "$SCALES" | grep -q '/'; then
+    # Multi-resolution format: scale_1080p / scale_4k
+    SCALE_1080=$(echo "$SCALES" | cut -d'/' -f1 | tr -d '[:space:]')
+    SCALE_4K=$(echo "$SCALES" | cut -d'/' -f2 | tr -d '[:space:]')
+
+    if [[ "$RES_HEIGHT" -ge 2160 ]]; then
+        SCALE="$SCALE_4K"
+    else
+        SCALE="$SCALE_1080"
+    fi
+else
+    # Single scale factor for all resolutions
+    SCALE=$(echo "$SCALES" | tr -d '[:space:]')
+fi
+
+# Skip if scale is 1.0 (no adjustment needed)
+if [[ "$SCALE" == "1.0" || "$SCALE" == "1" ]]; then
+    exec "$REAL_BIN" "$@"
+fi
+
+case "$TOOLKIT" in
+    gtk)
+        # GDK_SCALE only supports integers; use GDK_DPI_SCALE for fractional
+        export GDK_DPI_SCALE="$SCALE"
+        exec "$REAL_BIN" "$@"
+        ;;
+    qt)
+        export QT_SCALE_FACTOR="$SCALE"
+        exec "$REAL_BIN" "$@"
+        ;;
+    electron)
+        exec "$REAL_BIN" --force-device-scale-factor="$SCALE" "$@"
+        ;;
+    wine)
+        # Convert scale factor to DPI (base DPI is 96)
+        DPI=$(awk "BEGIN {printf \"%d\", 96 * $SCALE}")
+        DPI_HEX=$(printf '%08x' "$DPI")
+        # Find the Wine prefix for this app (check snap location first, then default)
+        WINEPREFIX="${WINEPREFIX:-}"
+        if [[ -z "$WINEPREFIX" ]]; then
+            SNAP_PREFIX="$HOME/snap/$APP_NAME/common/.wine"
+            if [[ -d "$SNAP_PREFIX" ]]; then
+                WINEPREFIX="$SNAP_PREFIX"
+            else
+                WINEPREFIX="$HOME/.wine"
+            fi
+        fi
+        # Set DPI in Wine registry
+        if [[ -f "$WINEPREFIX/user.reg" ]]; then
+            sed -i "s/\"LogPixels\"=dword:[0-9a-fA-F]*/\"LogPixels\"=dword:$DPI_HEX/" "$WINEPREFIX/user.reg"
+        fi
+        if [[ -f "$WINEPREFIX/system.reg" ]]; then
+            sed -i "s/\"LogPixels\"=dword:[0-9a-fA-F]*/\"LogPixels\"=dword:$DPI_HEX/" "$WINEPREFIX/system.reg"
+        fi
+        exec "$REAL_BIN" "$@"
+        ;;
+    *)
+        echo "scaled-launch: unknown toolkit '$TOOLKIT' for '$APP_NAME'" >&2
+        exec "$REAL_BIN" "$@"
+        ;;
+esac
