@@ -504,13 +504,171 @@ cmd_global() {
     fi
 }
 
+cmd_set() {
+    local app="${1:-}"
+    local scale="${2:-}"
+
+    if [[ -z "$app" || -z "$scale" ]]; then
+        echo "Usage: app-scaling set <app> <scale>" >&2
+        echo "" >&2
+        echo "Examples:" >&2
+        echo "  app-scaling set code 2.5              # single factor for all resolutions" >&2
+        echo "  app-scaling set code 1.0/2.5          # 1080p / 4K factors" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "No config found at $CONFIG" >&2
+        exit 1
+    fi
+
+    # Normalize scale format: allow "1.0 / 2.5" or "1.0/2.5"
+    scale=$(echo "$scale" | tr -d '[:space:]')
+
+    # Find the app line in the config
+    local line
+    line=$(get_app_lines | grep -E "^${app}\s*=" | head -1)
+
+    if [[ -z "$line" ]]; then
+        echo "App '$app' not found in config." >&2
+        echo "To add a new app, edit $CONFIG directly." >&2
+        exit 1
+    fi
+
+    local toolkit old_scales
+    toolkit=$(echo "$line" | sed 's/.*:\s*//' | tr -d '[:space:]')
+    old_scales=$(echo "$line" | sed 's/[^=]*=\s*//;s/\s*:.*//' | tr -d '[:space:]')
+
+    # Format the scale value with spaces around /
+    local formatted_scale
+    if echo "$scale" | grep -q '/'; then
+        local s1 s2
+        s1=$(echo "$scale" | cut -d'/' -f1)
+        s2=$(echo "$scale" | cut -d'/' -f2)
+        formatted_scale="$s1 / $s2"
+    else
+        formatted_scale="$scale"
+    fi
+
+    # Build the new line preserving alignment
+    local new_line
+    new_line=$(printf "%-*s= %s : %s" "${#app}" "$app" "$formatted_scale" "$toolkit")
+
+    # Replace the line in the config using sed
+    # Escape special characters for sed
+    local escaped_app
+    escaped_app=$(printf '%s' "$app" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
+    sed -i "s|^${escaped_app}\s*=.*:.*|${new_line}|" "$CONFIG"
+
+    if [[ -z "$old_scales" ]]; then
+        echo "$app: (default) -> $formatted_scale ($toolkit)"
+    else
+        echo "$app: $old_scales -> $formatted_scale ($toolkit)"
+    fi
+
+    # Regenerate wrappers and patches
+    echo ""
+    echo "Regenerating wrappers and desktop patches..."
+    generate-wrappers
+    patch-desktop-scaling
+    echo ""
+    echo "Done."
+}
+
+cmd_set_default() {
+    local toolkit="${1:-}"
+    local scale="${2:-}"
+
+    if [[ -z "$toolkit" || -z "$scale" ]]; then
+        echo "Usage: app-scaling set-default <toolkit> <scale>" >&2
+        echo "" >&2
+        echo "Toolkits: wine, qt, gtk, electron" >&2
+        echo "Example:  app-scaling set-default wine 3.0" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "No config found at $CONFIG" >&2
+        exit 1
+    fi
+
+    # Validate toolkit name
+    case "$toolkit" in
+        wine|qt|gtk|electron) ;;
+        *)
+            echo "Unknown toolkit: $toolkit" >&2
+            echo "Supported: wine, qt, gtk, electron" >&2
+            exit 1
+            ;;
+    esac
+
+    local old_val
+    old_val=$(get_default_scale "$toolkit")
+
+    # Check if the toolkit line exists (commented or uncommented) in the [defaults] section
+    local in_defaults=false
+    local found=false
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\[([a-zA-Z]+)\] ]]; then
+            [[ "${BASH_REMATCH[1]}" == "defaults" ]] && in_defaults=true || {
+                # If leaving defaults section without finding the toolkit, insert it
+                if $in_defaults && ! $found; then
+                    echo "$toolkit = $scale" >> "$tmpfile"
+                    found=true
+                fi
+                in_defaults=false
+            }
+            echo "$line" >> "$tmpfile"
+            continue
+        fi
+
+        if $in_defaults; then
+            # Match both commented and uncommented toolkit lines
+            if [[ "$line" =~ ^[#[:space:]]*(${toolkit})[[:space:]]*= ]]; then
+                echo "$toolkit = $scale" >> "$tmpfile"
+                found=true
+                continue
+            fi
+        fi
+
+        echo "$line" >> "$tmpfile"
+    done < "$CONFIG"
+
+    # If we ended while still in defaults and didn't find it
+    if $in_defaults && ! $found; then
+        echo "$toolkit = $scale" >> "$tmpfile"
+        found=true
+    fi
+
+    mv "$tmpfile" "$CONFIG"
+
+    if [[ -n "$old_val" ]]; then
+        echo "$toolkit default: $old_val -> $scale"
+    else
+        echo "$toolkit default: (unset) -> $scale"
+    fi
+
+    # Regenerate wrappers and patches
+    echo ""
+    echo "Regenerating wrappers and desktop patches..."
+    generate-wrappers
+    patch-desktop-scaling
+    echo ""
+    echo "Done."
+}
+
 case "${1:-}" in
-    setup)    cmd_setup ;;
-    teardown) cmd_teardown ;;
-    status)   cmd_status ;;
-    test)     shift; cmd_test "$@" ;;
-    global)   shift; cmd_global "$@" ;;
-    migrate)  cmd_migrate ;;
+    setup)       cmd_setup ;;
+    teardown)    cmd_teardown ;;
+    status)      cmd_status ;;
+    test)        shift; cmd_test "$@" ;;
+    set)         shift; cmd_set "$@" ;;
+    set-default) shift; cmd_set_default "$@" ;;
+    global)      shift; cmd_global "$@" ;;
+    migrate)     cmd_migrate ;;
     *)
         echo "Usage: app-scaling <command>"
         echo ""
@@ -519,6 +677,8 @@ case "${1:-}" in
         echo "  teardown           — remove wrappers + restore desktop files"
         echo "  status             — show what's configured and active"
         echo "  test APP           — show what scaling would be applied for an app"
+        echo "  set APP SCALE      — change an app's scale factor"
+        echo "  set-default TK SC  — change a toolkit's default scale"
         echo "  global PCT         — change GNOME fractional scaling percentage"
         echo "    --relative       — adjust per-app scale factors to compensate"
         echo "    --no-save        — don't write adjusted factors to scales.conf"
